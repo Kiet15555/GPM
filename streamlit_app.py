@@ -18,17 +18,115 @@ from io import BytesIO
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.preprocessing import StandardScaler
 from sklearn.cluster import KMeans
+import base64  # SỬA 3: Import để mã hóa ảnh
+import streamlit.components.v1 as components  # SỬA 3: Import để dùng HTML
 
 # --- Cấu hình Trang & Các thiết lập ban đầu ---
 warnings.filterwarnings('ignore')
 st.set_page_config(layout="wide", page_title="Tối ưu Danh mục VN30 Pro")
 # SỬA 1 & 2: Xóa icon và (Bản Full)
-st.title("Ứng dụng Phân tích & Tối ưu hóa Danh mục VN30")
+# [SỬA 4] CĂN GIỮA TIÊU ĐỀ
+st.markdown("<h1 style='text-align: center;'>Ứng dụng Phân tích & Tối ưu hóa Danh mục VN30</h1>", unsafe_allow_html=True)
+
+
+# --- [SỬA 3] THAY BANNER TĨNH BẰNG SLIDESHOW ---
+
+# Hàm để đọc và mã hóa ảnh sang Base64
+def get_image_base64(path):
+    try:
+        with open(path, "rb") as img_file:
+            return base64.b64encode(img_file.read()).decode('utf-8')
+    except FileNotFoundError:
+        return None
+
+# [SỬA 6] Thêm banner6.jpg vào danh sách
+image_paths = ["banner1.jpg", "banner2.jpg", "banner3.jpg", "banner4.jpg", "banner5.jpg", "banner6.jpg"]
+base64_images = []
+for path in image_paths:
+    b64_img = get_image_base64(path)
+    if b64_img:
+        base64_images.append(b64_img)
+
+if base64_images:
+    # Tạo chuỗi HTML cho các ảnh
+    html_images = ""
+    for b64_img in base64_images:
+        # Giả định tất cả là jpeg, có thể cần đổi nếu là png
+        html_images += f'<img class="mySlides fade" src="data:image/jpeg;base64,{b64_img}" style="width:100%">'
+    
+    # Tạo mã HTML/CSS/JS cho slideshow
+    html_code = f"""
+    <style>
+    .slideshow-container {{
+      width: 100%;
+      position: relative;
+      margin: auto;
+      /* [SỬA 6] Xóa max-height để ảnh không bị cắt */
+      /* max-height: 450px; */ 
+      overflow: hidden;
+      border-radius: 8px; /* Bo góc */
+    }}
+    .mySlides {{
+      display: none; /* Ẩn tất cả ảnh ban đầu */
+      width: 100%;
+      /* [SỬA 6] Đặt chiều cao tự động để ảnh không bị cắt */
+      height: auto; 
+      object-fit: contain; /* [SỬA 6] Đổi từ cover sang contain để ảnh hiển thị toàn bộ */
+      vertical-align: middle;
+    }}
+    /* Hiệu ứng mờ dần */
+    .fade {{
+      animation-name: fade;
+      animation-duration: 3s; /* Giữ nguyên 3s để mềm mại */
+    }}
+    @keyframes fade {{
+      from {{opacity: .4}}
+      to {{opacity: 1}}
+    }}
+    </style>
+
+    <div class="slideshow-container">
+      {html_images}
+    </div>
+
+    <script>
+    let slideIndex = 0;
+    showSlides(); // Bắt đầu slideshow
+
+    function showSlides() {{
+      let i;
+      let slides = document.getElementsByClassName("mySlides");
+      if (slides.length === 0) return; // Không có ảnh thì dừng
+      
+      // Ẩn tất cả ảnh
+      for (i = 0; i < slides.length; i++) {{
+        slides[i].style.display = "none";
+      }}
+      
+      slideIndex++;
+      if (slideIndex > slides.length) {{slideIndex = 1}} // Quay lại ảnh đầu tiên
+      
+      slides[slideIndex-1].style.display = "block"; // Hiển thị ảnh hiện tại
+      
+      setTimeout(showSlides, 5000); // Giữ nguyên 5 giây chuyển ảnh
+    }}
+    </script>
+    """
+    # [SỬA 6] Để chiều cao của component linh hoạt, có thể bỏ height hoặc dùng 1 giá trị lớn hơn nếu cần.
+    # Hoặc để trống nếu muốn nó tự động co giãn hoàn toàn theo nội dung
+    components.html(html_code, height=500) # Tăng nhẹ chiều cao mặc định cho HTML component
+else:
+    st.warning("""
+    Không tìm thấy file banner! Vui lòng:
+    1. Đổi tên các file ảnh thành: `banner1.jpg`, `banner2.jpg`, `banner3.jpg`, `banner4.jpg`, `banner5.jpg`, `banner6.jpg`
+    2. Đặt các file này vào CÙNG THƯ MỤC với tệp `streamlit_app.py`
+    """)
+# --- KẾT THÚC SỬA BANNER ---
+
 
 # Set theme mặc định cho Plotly
 pio.templates.default = "plotly_dark"
-
-
+# ... (Phần còn lại của code không thay đổi) ...
 # === CÁC HÀM ĐỊNH NGHĨA (GỘP TỪ CÁC FILE) ===
 
 # --- Từ Step2.py (Ô 2) ---
@@ -1582,3 +1680,6 @@ if st.session_state.analysis_done:
                 ticker = best_in_cluster.iloc[0]['Ticker']
                 sharpe = best_in_cluster.iloc[0]['sharpe']
                 st.write(f"- **Nhóm {cluster_id}**: Chọn **{ticker}** (Sharpe = {sharpe:.2f})")
+
+# [SỬA 2] Xóa bỏ dấu } bị lỗi
+# }
