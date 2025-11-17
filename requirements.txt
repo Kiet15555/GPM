@@ -6,4 +6,5 @@ plotly
 scipy
 quantstats
 pyarrow
-IPython
+scikit-learn
+xlsxwriter

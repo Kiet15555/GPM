@@ -14,11 +14,16 @@ import plotly.io as pio
 from plotly.subplots import make_subplots 
 from scipy.optimize import minimize
 import quantstats as qs
+from io import BytesIO
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.preprocessing import StandardScaler
+from sklearn.cluster import KMeans
 
 # --- Cấu hình Trang & Các thiết lập ban đầu ---
 warnings.filterwarnings('ignore')
 st.set_page_config(layout="wide", page_title="Tối ưu Danh mục VN30 Pro")
-st.title("📈 Ứng dụng Phân tích & Tối ưu hóa Danh mục VN30 (Bản Full)")
+# SỬA 1 & 2: Xóa icon và (Bản Full)
+st.title("Ứng dụng Phân tích & Tối ưu hóa Danh mục VN30")
 
 # Set theme mặc định cho Plotly
 pio.templates.default = "plotly_dark"
@@ -243,6 +248,241 @@ def run_simple_backtest(daily_returns_df: pd.DataFrame,
     cumulative_returns = (1 + port_returns_daily).cumprod()
     return port_returns_daily, cumulative_returns
 
+# --- [MỚI] Hàm phân tích Rebalancing ---
+def analyze_rebalancing(returns_df, target_weights, rebalance_freq='Q', transaction_cost=0.001):
+    """
+    Phân tích chiến lược rebalancing
+    rebalance_freq: 'M' (Monthly), 'Q' (Quarterly), 'Y' (Yearly)
+    transaction_cost: Chi phí giao dịch (%)
+    """
+    # Xác định tần suất rebalance (số ngày)
+    if rebalance_freq == 'M':
+        rebalance_days = 21  # ~1 tháng
+    elif rebalance_freq == 'Q':
+        rebalance_days = 63  # ~3 tháng
+    else:  # 'Y'
+        rebalance_days = 252  # ~1 năm
+    
+    dates = returns_df.index
+    n_periods = len(dates)
+    
+    # Khởi tạo giá trị danh mục
+    rebal_value = 1.0
+    bh_value = 1.0
+    
+    rebal_values = [rebal_value]
+    bh_values = [bh_value]
+    rebalance_dates = []
+    total_costs = 0
+    
+    # Giá trị tuyệt đối của từng asset (không phải %)
+    rebal_assets = target_weights.copy() * rebal_value
+    bh_assets = target_weights.copy() * bh_value
+    
+    days_since_rebalance = 0
+    
+    for i in range(1, n_periods):
+        daily_returns = returns_df.iloc[i].values
+        days_since_rebalance += 1
+        
+        # === REBALANCED PORTFOLIO ===
+        # Cập nhật giá trị từng asset theo returns
+        rebal_assets = rebal_assets * (1 + daily_returns)
+        rebal_value = rebal_assets.sum()
+        
+        # Kiểm tra rebalance
+        if days_since_rebalance >= rebalance_days:
+            # Tính tỷ trọng hiện tại
+            current_weights = rebal_assets / rebal_value
+            
+            # Chi phí giao dịch
+            turnover = np.abs(current_weights - target_weights).sum()
+            cost = turnover * transaction_cost
+            total_costs += cost
+            
+            # Trừ chi phí
+            rebal_value = rebal_value * (1 - cost)
+            
+            # Rebalance về target weights
+            rebal_assets = target_weights * rebal_value
+            
+            rebalance_dates.append(dates[i])
+            days_since_rebalance = 0
+        
+        rebal_values.append(rebal_value)
+        
+        # === BUY & HOLD ===
+        bh_assets = bh_assets * (1 + daily_returns)
+        bh_value = bh_assets.sum()
+        bh_values.append(bh_value)
+    
+    return {
+        'rebalanced_value': pd.Series(rebal_values, index=dates),
+        'buy_hold_value': pd.Series(bh_values, index=dates),
+        'rebalance_dates': rebalance_dates,
+        'total_costs': total_costs,
+        'num_rebalances': len(rebalance_dates)
+    }
+
+# --- [MỚI] Hàm export Excel ---
+def export_to_excel(weights_df, summary_table, returns_df, price_pivot):
+    """Xuất kết quả ra file Excel"""
+    output = BytesIO()
+    with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+        # Sheet 1: Tỷ trọng tối ưu
+        weights_df.to_excel(writer, sheet_name='Tỷ trọng tối ưu')
+        
+        # Sheet 2: Bảng tổng kết
+        summary_table.to_excel(writer, sheet_name='Tổng kết hiệu suất')
+        
+        # Sheet 3: Returns
+        returns_df.to_excel(writer, sheet_name='Tỷ suất sinh lời')
+        
+        # Sheet 4: Prices
+        price_pivot.to_excel(writer, sheet_name='Giá đóng cửa')
+        
+        # Sheet 5: Hướng dẫn
+        instructions = pd.DataFrame({
+            'Sheet': ['Tỷ trọng tối ưu', 'Tổng kết hiệu suất', 'Tỷ suất sinh lời', 'Giá đóng cửa'],
+            'Mô tả': [
+                'Phân bổ tỷ trọng % cho 3 chiến lược đầu tư',
+                'Các chỉ số đánh giá hiệu suất (CAGR, Sharpe, Drawdown...)',
+                'Tỷ suất sinh lời hàng ngày của từng cổ phiếu',
+                'Giá đóng cửa điều chỉnh của từng cổ phiếu'
+            ]
+        })
+        instructions.to_excel(writer, sheet_name='Hướng dẫn', index=False)
+    
+    return output.getvalue()
+
+# --- [MỚI] Phân loại Sector ---
+SECTOR_MAPPING = {
+    # Banking
+    'ACB': 'Ngân hàng', 'BID': 'Ngân hàng', 'CTG': 'Ngân hàng', 'HDB': 'Ngân hàng',
+    'LPB': 'Ngân hàng', 'MBB': 'Ngân hàng', 'SHB': 'Ngân hàng', 'SSB': 'Ngân hàng',
+    'STB': 'Ngân hàng', 'TCB': 'Ngân hàng', 'TPB': 'Ngân hàng', 'VCB': 'Ngân hàng',
+    'VIB': 'Ngân hàng', 'VPB': 'Ngân hàng',
+    
+    # Real Estate
+    'VHM': 'Bất động sản', 'VIC': 'Bất động sản', 'VRE': 'Bất động sản',
+    
+    # Oil & Gas
+    'GAS': 'Dầu khí', 'PLX': 'Dầu khí', 'GVR': 'Dầu khí',
+    
+    # Manufacturing
+    'HPG': 'Sản xuất', 'GVR': 'Sản xuất',
+    
+    # Consumer
+    'MSN': 'Tiêu dùng', 'MWG': 'Tiêu dùng', 'SAB': 'Tiêu dùng', 'VNM': 'Tiêu dùng',
+    
+    # Technology
+    'FPT': 'Công nghệ',
+    
+    # Insurance
+    'BVH': 'Bảo hiểm',
+    
+    # Aviation
+    'VJC': 'Hàng không',
+    
+    # Securities
+    'SSI': 'Chứng khoán',
+    
+    # Mining
+    'BCM': 'Khai khoáng'
+}
+
+def get_sector_allocation(weights_df):
+    """Tính phân bổ theo ngành"""
+    sector_data = {}
+    for portfolio in weights_df.columns:
+        sector_weights = {}
+        for ticker, weight in weights_df[portfolio].items():
+            if weight > 0.001:
+                sector = SECTOR_MAPPING.get(ticker, 'Khác')
+                sector_weights[sector] = sector_weights.get(sector, 0) + weight
+        sector_data[portfolio] = sector_weights
+    return pd.DataFrame(sector_data).fillna(0)
+
+# --- [MỚI] Machine Learning: Dự đoán Return ---
+def ml_predict_returns(returns_df, price_pivot):
+    """Sử dụng Random Forest để dự đoán returns"""
+    predictions = {}
+    feature_importance = {}
+    
+    for ticker in returns_df.columns:  # Train cho TẤT CẢ cổ phiếu
+        try:
+            # Tạo features
+            df = pd.DataFrame()
+            df['return'] = returns_df[ticker]
+            df['return_lag1'] = df['return'].shift(1)
+            df['return_lag2'] = df['return'].shift(2)
+            df['return_lag3'] = df['return'].shift(3)
+            df['return_ma5'] = df['return'].rolling(5).mean()
+            df['return_ma20'] = df['return'].rolling(20).mean()
+            df['volatility_20'] = df['return'].rolling(20).std()
+            df = df.dropna()
+            
+            if len(df) < 100:
+                continue
+            
+            # Train/Test split
+            train_size = int(len(df) * 0.8)
+            X_train = df.iloc[:train_size, 1:]
+            y_train = df.iloc[:train_size, 0]
+            X_test = df.iloc[train_size:, 1:]
+            y_test = df.iloc[train_size:, 0]
+            
+            # Train model
+            scaler = StandardScaler()
+            X_train_scaled = scaler.fit_transform(X_train)
+            X_test_scaled = scaler.transform(X_test)
+            
+            model = RandomForestRegressor(n_estimators=50, max_depth=5, random_state=42, n_jobs=-1)
+            model.fit(X_train_scaled, y_train)
+            
+            # Predict
+            y_pred = model.predict(X_test_scaled)
+            
+            predictions[ticker] = {
+                'actual': y_test.values,
+                'predicted': y_pred,
+                'score': model.score(X_test_scaled, y_test)
+            }
+            
+            feature_importance[ticker] = pd.Series(
+                model.feature_importances_,
+                index=X_train.columns
+            )
+        except:
+            continue
+    
+    return predictions, feature_importance
+
+# --- [MỚI] Clustering cổ phiếu ---
+def cluster_stocks(returns_df, n_clusters=3):
+    """Phân nhóm cổ phiếu theo đặc tính"""
+    # Tính features cho mỗi cổ phiếu
+    features = pd.DataFrame({
+        'mean_return': returns_df.mean(),
+        'volatility': returns_df.std(),
+        'sharpe': returns_df.mean() / returns_df.std(),
+        'skewness': returns_df.skew(),
+        'kurtosis': returns_df.kurtosis()
+    })
+    
+    # Chuẩn hóa
+    scaler = StandardScaler()
+    features_scaled = scaler.fit_transform(features)
+    
+    # Clustering
+    kmeans = KMeans(n_clusters=n_clusters, random_state=42)
+    clusters = kmeans.fit_predict(features_scaled)
+    
+    features['Cluster'] = clusters
+    features['Ticker'] = features.index
+    
+    return features
+
 
 # === GIAO DIỆN STREAMLIT ===
 
@@ -271,6 +511,21 @@ RISK_FREE_RATE = risk_free_rate_pct / 100.0
 N_SIMULATIONS = st.sidebar.number_input(
     'Số lần Mô phỏng Monte Carlo:',
     min_value=1000, max_value=50000, value=5000, step=1000
+)
+
+# THÊM: Giới hạn tỷ trọng để đa dạng hóa
+st.sidebar.subheader("⚖️ Đa dạng hóa Danh mục")
+max_weight_pct = st.sidebar.slider(
+    'Tỷ trọng tối đa mỗi cổ phiếu (%):', 
+    min_value=5, max_value=100, value=30, step=5,
+    help="Giới hạn tỷ trọng để tránh tập trung rủi ro vào 1 cổ phiếu"
+)
+MAX_WEIGHT = max_weight_pct / 100.0
+
+min_stocks = st.sidebar.number_input(
+    'Số cổ phiếu tối thiểu trong danh mục:',
+    min_value=3, max_value=30, value=5, step=1,
+    help="Đảm bảo danh mục có ít nhất X cổ phiếu để đa dạng"
 )
 
 force_refresh_checkbox = st.sidebar.checkbox(
@@ -347,29 +602,61 @@ if run_button:
         )
         st.session_state.eff_frontier_df = eff_frontier_df
 
-    # 5. Chạy Tối ưu hóa
-    with st.spinner("⏳ (5/7) Đang chạy Tối ưu hóa..."):
+    # 5. Chạy Tối ưu hóa (CÓ GIỚI HẠN ĐA DẠNG HÓA)
+    with st.spinner("⏳ (5/7) Đang chạy Tối ưu hóa với giới hạn đa dạng..."):
         num_assets = len(st.session_state.expected_returns)
         args = (st.session_state.expected_returns, st.session_state.cov_matrix, RISK_FREE_RATE)
-        constraints = ({'type': 'eq', 'fun': lambda x: np.sum(x) - 1})
-        bounds = tuple((0.0, 1.0) for _ in range(num_assets))
+        
+        # Ràng buộc: Tổng = 1, Tỷ trọng <= MAX_WEIGHT, Số cổ phiếu >= min_stocks
+        constraints = [
+            {'type': 'eq', 'fun': lambda x: np.sum(x) - 1},  # Tổng = 100%
+        ]
+        bounds = tuple((0.0, MAX_WEIGHT) for _ in range(num_assets))  # Giới hạn từng cổ phiếu
 
-        # 1. Min Risk
+        # 1. Min Risk với đa dạng hóa
         min_vol_guess_weights = sim_data_df.loc[sim_data_df['Risk'].idxmin()].values[3:3+num_assets]
+        min_vol_guess_weights = np.clip(min_vol_guess_weights, 0, MAX_WEIGHT)
+        min_vol_guess_weights /= min_vol_guess_weights.sum()
+        
         opt_min_vol = minimize(minimize_portfolio_risk, min_vol_guess_weights, args=args,
                                method='SLSQP', bounds=bounds, constraints=constraints)
         min_vol_weights = opt_min_vol.x
+        
+        # Đảm bảo có đủ số cổ phiếu
+        if np.sum(min_vol_weights > 0.001) < min_stocks:
+            # Phân bổ đều cho top N cổ phiếu có risk thấp nhất
+            top_n_idx = np.argsort(np.diag(st.session_state.cov_matrix))[:min_stocks]
+            min_vol_weights = np.zeros(num_assets)
+            min_vol_weights[top_n_idx] = 1.0 / min_stocks
 
-        # 2. Max Sharpe
+        # 2. Max Sharpe với đa dạng hóa
         max_sharpe_guess_weights = sim_data_df.loc[sim_data_df['Sharpe'].idxmax()].values[3:3+num_assets]
+        max_sharpe_guess_weights = np.clip(max_sharpe_guess_weights, 0, MAX_WEIGHT)
+        max_sharpe_guess_weights /= max_sharpe_guess_weights.sum()
+        
         opt_max_sharpe = minimize(minimize_negative_sharpe, max_sharpe_guess_weights, args=args,
                                   method='SLSQP', bounds=bounds, constraints=constraints)
         max_sharpe_weights = opt_max_sharpe.x
         
-        # 3. Max Return
+        if np.sum(max_sharpe_weights > 0.001) < min_stocks:
+            top_n_idx = np.argsort(-st.session_state.expected_returns)[:min_stocks]
+            max_sharpe_weights = np.zeros(num_assets)
+            max_sharpe_weights[top_n_idx] = 1.0 / min_stocks
+        
+        # 3. Max Return với đa dạng hóa (không cho phép 100% vào 1 cổ phiếu)
+        top_n_returns_idx = np.argsort(-st.session_state.expected_returns)[:min_stocks]
         max_ret_weights = np.zeros(num_assets)
-        max_ret_index = st.session_state.expected_returns.argmax()
-        max_ret_weights[max_ret_index] = 1.0
+        
+        # Phân bổ theo tỷ lệ lợi nhuận của top stocks
+        top_returns = st.session_state.expected_returns.values[top_n_returns_idx]
+        top_returns = np.maximum(top_returns, 0)  # Chỉ lấy returns dương
+        if top_returns.sum() > 0:
+            max_ret_weights[top_n_returns_idx] = top_returns / top_returns.sum()
+            max_ret_weights = np.clip(max_ret_weights, 0, MAX_WEIGHT)
+            max_ret_weights /= max_ret_weights.sum()
+        else:
+            # Nếu không có returns dương, phân bổ đều
+            max_ret_weights[top_n_returns_idx] = 1.0 / min_stocks
 
         st.session_state.optimal_weights_df = pd.DataFrame({
             'Bảo thủ (Min Risk)': min_vol_weights,
@@ -383,6 +670,13 @@ if run_button:
             'min_vol': get_portfolio_stats(min_vol_weights, *args),
             'max_sharpe': get_portfolio_stats(max_sharpe_weights, *args),
             'max_ret': get_portfolio_stats(max_ret_weights, *args)
+        }
+        
+        # THÊM: Tính số cổ phiếu thực tế trong mỗi danh mục
+        st.session_state.num_stocks = {
+            'Bảo thủ (Min Risk)': np.sum(min_vol_weights > 0.001),
+            'Cân bằng (Max Sharpe)': np.sum(max_sharpe_weights > 0.001),
+            'Mạo hiểm (Max Return)': np.sum(max_ret_weights > 0.001)
         }
 
     # 6. Chạy Backtest
@@ -427,21 +721,207 @@ if run_button:
 
 if st.session_state.analysis_done:
     
-    tab1, tab2, tab3 = st.tabs(["Đường biên Hiệu quả & Tỷ trọng", "Kết quả Backtest", "Dữ liệu Thô & Tương quan"])
+    # THÊM: Nút Export ở đầu
+    st.markdown("---")
+    col_export1, col_export2, col_export3 = st.columns([1, 1, 2])
+    
+    with col_export1:
+        # Export Excel
+        excel_data = export_to_excel(
+            st.session_state.optimal_weights_df,
+            st.session_state.summary_table,
+            st.session_state.returns_df,
+            st.session_state.price_pivot
+        )
+        st.download_button(
+            label="📥 Tải xuống Excel",
+            data=excel_data,
+            file_name=f"Portfolio_Analysis_{datetime.now().strftime('%Y%m%d')}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
+    
+    with col_export2:
+        # Export CSV
+        csv_data = st.session_state.optimal_weights_df.to_csv()
+        st.download_button(
+            label="📥 Tải xuống CSV",
+            data=csv_data,
+            file_name=f"Portfolio_Weights_{datetime.now().strftime('%Y%m%d')}.csv",
+            mime="text/csv"
+        )
+    
+    with col_export3:
+        st.info("💾 Tải xuống kết quả phân tích để lưu trữ hoặc báo cáo")
+    
+    st.markdown("---")
+    
+    # THÊM: Thêm tab mới
+    tab1, tab2, tab3, tab4, tab5 = st.tabs([
+        "📊 Dữ liệu & Tương quan", 
+        "🎯 Tỷ trọng & Đường biên", 
+        "📈 Backtest & Hiệu suất",
+        "🛡️ Rủi ro & Đa dạng",
+        "🏢 Phân tích Ngành & ML"
+    ])
 
+    # Tab 1: Dữ liệu Thô & Tương quan
     with tab1:
-        st.header("1. Phân bổ Tỷ trọng & Đường biên Hiệu quả")
+        st.header("📊 Dữ liệu Thô & Phân tích Tương quan")
+        
+        # THÊM: Thống kê mô tả
+        st.subheader("Thống kê Mô tả Tỷ suất Sinh lời")
+        returns_df = st.session_state.returns_df
+        desc_stats = returns_df.describe().T
+        desc_stats['skew'] = returns_df.skew()
+        desc_stats['kurtosis'] = returns_df.kurtosis()
+        desc_stats_styled = desc_stats.style.format({
+            'mean': '{:.4f}',
+            'std': '{:.4f}',
+            'min': '{:.4f}',
+            '25%': '{:.4f}',
+            '50%': '{:.4f}',
+            '75%': '{:.4f}',
+            'max': '{:.4f}',
+            'skew': '{:.2f}',
+            'kurtosis': '{:.2f}'
+        })
+        st.dataframe(desc_stats_styled, use_container_width=True)
+        
+        # THÊM: Biểu đồ phân phối lợi nhuận
+        st.subheader("Phân phối Lợi nhuận Hàng ngày (Top 10 cổ phiếu)")
+        top_10_tickers = st.session_state.expected_returns.nlargest(10).index.tolist()
+        fig_dist = go.Figure()
+        for ticker in top_10_tickers:
+            fig_dist.add_trace(go.Histogram(
+                x=returns_df[ticker].dropna(),
+                name=ticker,
+                opacity=0.6,
+                nbinsx=50
+            ))
+        fig_dist.update_layout(
+            title='Phân phối Lợi nhuận Hàng ngày (Top 10 cổ phiếu theo Return kỳ vọng)',
+            xaxis_title='Tỷ suất sinh lời',
+            yaxis_title='Tần suất',
+            barmode='overlay',
+            template='plotly_dark',
+            height=500
+        )
+        st.plotly_chart(fig_dist, use_container_width=True)
+        
+        st.subheader("Heatmap Ma trận Tương quan")
+        correlation_matrix = returns_df.corr()
+        labels = correlation_matrix.columns
+        fig_heatmap = go.Figure(data=go.Heatmap(
+            z=correlation_matrix.values, x=labels, y=labels,
+            colorscale='RdBu_r', zmin=-1, zmax=1,
+            hoverongaps=False,
+            text=correlation_matrix.values,
+            texttemplate='%{text:.2f}',
+            textfont={"size": 8}
+        ))
+        fig_heatmap.update_layout(
+            title='Heatmap Ma trận Tương quan (VN30)', 
+            template='plotly_dark',
+            height=800, width=900,
+            yaxis_autorange='reversed'
+        )
+        st.plotly_chart(fig_heatmap, use_container_width=True)
+        
+        # THÊM: Biểu đồ cặp tương quan cao nhất
+        st.subheader("Top 10 cặp cổ phiếu có Tương quan cao nhất")
+        corr_pairs = []
+        for i in range(len(correlation_matrix.columns)):
+            for j in range(i+1, len(correlation_matrix.columns)):
+                corr_pairs.append({
+                    'Cặp': f"{correlation_matrix.columns[i]} - {correlation_matrix.columns[j]}",
+                    'Tương quan': correlation_matrix.iloc[i, j]
+                })
+        corr_pairs_df = pd.DataFrame(corr_pairs).sort_values('Tương quan', ascending=False).head(10)
+        fig_corr_pairs = px.bar(
+            corr_pairs_df, x='Tương quan', y='Cặp', orientation='h',
+            title='Top 10 cặp cổ phiếu có Tương quan cao nhất',
+            text='Tương quan'
+        )
+        fig_corr_pairs.update_traces(texttemplate='%{text:.3f}', textposition='outside')
+        fig_corr_pairs.update_layout(template='plotly_dark', height=500)
+        st.plotly_chart(fig_corr_pairs, use_container_width=True)
+        
+        st.subheader("Dữ liệu Giá Đóng cửa (Pivot - 10 dòng cuối)")
+        st.dataframe(st.session_state.price_pivot.tail(10))
+        
+        st.subheader("Dữ liệu Tỷ suất sinh lời (Hàng ngày - 10 dòng cuối)")
+        st.dataframe(st.session_state.returns_df.tail(10))
+
+    # Tab 2: Phân bổ Tỷ trọng & Đường biên
+    with tab2:
+        st.header("🎯 Phân bổ Tỷ trọng & Đường biên Hiệu quả")
+        
+        # THÊM: Hiển thị thông tin đa dạng hóa
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.metric("🛡️ Tỷ trọng tối đa", f"{MAX_WEIGHT*100:.0f}%")
+        with col2:
+            st.metric("📊 Số cổ phiếu tối thiểu", f"{min_stocks} cổ phiếu")
+        with col3:
+            avg_stocks = np.mean(list(st.session_state.num_stocks.values()))
+            st.metric("📈 Số cổ phiếu TB trong danh mục", f"{avg_stocks:.1f} cổ phiếu")
+        
+        st.divider()
         
         # --- PHẦN 1: BẢNG SỐ LIỆU ---
-        st.subheader("Phân bổ Tỷ trọng Tối ưu")
+        st.subheader("📋 Phân bổ Tỷ trọng Tối ưu")
         df_weights = st.session_state.optimal_weights_df
-        df_weights_styled = df_weights[(df_weights > 0.001).any(axis=1)].style.format("{:.2%}")
+        df_weights_display = df_weights[(df_weights > 0.001).any(axis=1)].copy()
+        
+        # THÊM: Số lượng cổ phiếu trong mỗi danh mục
+        num_stocks_row = pd.DataFrame({
+            col: [f"{st.session_state.num_stocks[col]} cổ phiếu"] 
+            for col in df_weights.columns
+        }, index=['Số lượng CP'])
+        
+        st.info(f"**Nguyên tắc đa dạng hóa**: Mỗi cổ phiếu không vượt quá {MAX_WEIGHT*100:.0f}%, đảm bảo ít nhất {min_stocks} cổ phiếu trong danh mục")
+        
+        # Hiển thị số lượng cổ phiếu
+        st.dataframe(num_stocks_row, use_container_width=True)
+        
+        df_weights_styled = df_weights_display.style.format("{:.2%}").background_gradient(
+            cmap='RdYlGn', axis=0, vmin=0, vmax=MAX_WEIGHT
+        )
         st.dataframe(df_weights_styled, use_container_width=True)
         
         st.divider()
         
-        # --- PHẦN 2: BIỂU ĐỒ TỶ TRỌNG ---
-        st.subheader("Biểu đồ Tỷ trọng")
+        # --- PHẦN 2: BIỂU ĐỒ TRÒN TỶ TRỌNG ---
+        st.subheader("Biểu đồ Tròn - Cơ cấu Danh mục")
+        selected_portfolio = st.selectbox(
+            "Chọn danh mục để xem chi tiết:",
+            options=df_weights.columns.tolist()
+        )
+        
+        weights_selected = df_weights[selected_portfolio]
+        weights_selected = weights_selected[weights_selected > 0.001].sort_values(ascending=False)
+        
+        fig_pie = go.Figure(data=[go.Pie(
+            labels=weights_selected.index,
+            values=weights_selected.values,
+            hole=0.4,
+            textposition='auto',
+            textinfo='label+percent',
+            marker=dict(line=dict(color='#000000', width=2))
+        )])
+        fig_pie.update_layout(
+            title=f'Cơ cấu Danh mục: {selected_portfolio}',
+            template='plotly_dark',
+            height=600,
+            annotations=[dict(text=f'{len(weights_selected)}<br>cổ phiếu', 
+                            x=0.5, y=0.5, font_size=20, showarrow=False)]
+        )
+        st.plotly_chart(fig_pie, use_container_width=True)
+        
+        st.divider()
+        
+        # --- PHẦN 3: BIỂU ĐỒ TỶ TRỌNG SO SÁNH ---
+        st.subheader("Biểu đồ Tỷ trọng - So sánh 3 Danh mục")
         df_plot = df_weights[(df_weights > 0.001).any(axis=1)].copy()
         
         df_plot_long = df_plot.reset_index().melt(
@@ -453,15 +933,17 @@ if st.session_state.analysis_done:
         
         fig_bars = px.bar(
             df_plot_long, x='Danh mục', y='Tỷ trọng', color='Mã CP',
-            text_auto='.2%',
+            text_auto='.1%',
             title='Phân bổ Tỷ trọng Tối ưu theo 3 Khẩu vị Rủi ro'
         )
-        fig_bars.update_layout(template='plotly_dark', yaxis_tickformat='.0%', height=500)
+        fig_bars.update_layout(template='plotly_dark', yaxis_tickformat='.0%', height=600)
+        fig_bars.add_hline(y=MAX_WEIGHT, line_dash="dash", line_color="red", 
+                          annotation_text=f"Giới hạn {MAX_WEIGHT*100:.0f}%")
         st.plotly_chart(fig_bars, use_container_width=True)
             
         st.divider()
 
-        # --- PHẦN 3: BIỂU ĐỒ ĐƯỜNG BIÊN HIỆU QUẢ ---
+        # --- PHẦN 4: BIỂU ĐỒ ĐƯỜNG BIÊN HIỆU QUẢ ---
         st.subheader("Đường biên Hiệu quả Toàn diện (có CAL)")
         
         # FIX: THÊM render_mode='svg' ĐỂ SỬA LỖI WEBGL
@@ -470,7 +952,7 @@ if st.session_state.analysis_done:
             sim_data_df, x='Risk', y='Return', color='Sharpe',
             color_continuous_scale='Viridis',
             hover_data={col: ':.2%' for col in sim_data_df.columns if col not in ['Risk', 'Return', 'Sharpe']} | {'Risk': ':.2%','Return': ':.2%','Sharpe': ':.2f'},
-            title=f'Đường biên Hiệu quả - {N_SIMULATIONS} danh mục (Rf={RISK_FREE_RATE:.1%})',
+            title=f'Đường biên Hiệu quả - {N_SIMULATIONS} danh mục (Rf={RISK_FREE_RATE:.1%}, Max Weight={MAX_WEIGHT:.0%})',
             render_mode='svg' # <--- ĐÂY LÀ FIX QUAN TRỌNG
         )
         
@@ -488,27 +970,69 @@ if st.session_state.analysis_done:
         stats_max_sharpe = stats_dict['max_sharpe']
         stats_max_ret = stats_dict['max_ret']
         
-        fig.add_trace(go.Scatter(x=[stats_min_vol[1]], y=[stats_min_vol[0]], mode='markers', marker=dict(color='white', size=15, symbol='star', line=dict(color='black', width=2)), name='Bảo thủ (Min Risk)'))
-        fig.add_trace(go.Scatter(x=[stats_max_sharpe[1]], y=[stats_max_sharpe[0]], mode='markers', marker=dict(color='cyan', size=15, symbol='star', line=dict(color='black', width=2)), name='Cân bằng (Max Sharpe)'))
-        fig.add_trace(go.Scatter(x=[stats_max_ret[1]], y=[stats_max_ret[0]], mode='markers', marker=dict(color='red', size=15, symbol='star', line=dict(color='black', width=2)), name='Mạo hiểm (Max Return)'))
+        fig.add_trace(go.Scatter(x=[stats_min_vol[1]], y=[stats_min_vol[0]], mode='markers', 
+                                marker=dict(color='white', size=20, symbol='star', 
+                                          line=dict(color='black', width=2)), 
+                                name='Bảo thủ (Min Risk)',
+                                hovertemplate='<b>Bảo thủ</b><br>Risk: %{x:.2%}<br>Return: %{y:.2%}'))
+        fig.add_trace(go.Scatter(x=[stats_max_sharpe[1]], y=[stats_max_sharpe[0]], mode='markers', 
+                                marker=dict(color='cyan', size=20, symbol='star', 
+                                          line=dict(color='black', width=2)), 
+                                name='Cân bằng (Max Sharpe)',
+                                hovertemplate='<b>Cân bằng</b><br>Risk: %{x:.2%}<br>Return: %{y:.2%}'))
+        fig.add_trace(go.Scatter(x=[stats_max_ret[1]], y=[stats_max_ret[0]], mode='markers', 
+                                marker=dict(color='red', size=20, symbol='star', 
+                                          line=dict(color='black', width=2)), 
+                                name='Mạo hiểm (Max Return)',
+                                hovertemplate='<b>Mạo hiểm</b><br>Risk: %{x:.2%}<br>Return: %{y:.2%}'))
         
         # Vẽ Đường CAL
         sharpe_risk = stats_max_sharpe[1]
         sharpe_return = stats_max_sharpe[0]
         x_cal = [0, sharpe_risk * 1.5] 
         y_cal = [RISK_FREE_RATE, (sharpe_return - RISK_FREE_RATE) / (sharpe_risk + 1e-9) * (sharpe_risk * 1.5) + RISK_FREE_RATE]
-        fig.add_trace(go.Scatter(x=x_cal, y=y_cal, mode='lines', line=dict(color='lime', width=2, dash='dash'), name='Đường Phân bổ Vốn (CAL)'))
+        fig.add_trace(go.Scatter(x=x_cal, y=y_cal, mode='lines', 
+                                line=dict(color='lime', width=3, dash='dash'), 
+                                name='Đường Phân bổ Vốn (CAL)'))
 
         fig.update_layout(
             height=800,
             xaxis_tickformat='.1%', yaxis_tickformat='.1%',
-            legend=dict(orientation="h", yanchor="bottom", y=-0.2, xanchor="center", x=0.5),
-            margin=dict(b=100)
+            legend=dict(orientation="h", yanchor="bottom", y=-0.15, xanchor="center", x=0.5),
+            margin=dict(b=120)
         )
         st.plotly_chart(fig, use_container_width=True)
+        
+        # THÊM: Bảng so sánh 3 danh mục
+        st.subheader("So sánh Chỉ số của 3 Danh mục Tối ưu")
+        comparison_df = pd.DataFrame({
+            'Bảo thủ (Min Risk)': [
+                f"{stats_min_vol[0]:.2%}", 
+                f"{stats_min_vol[1]:.2%}", 
+                f"{stats_min_vol[2]:.2f}",
+                f"{st.session_state.num_stocks['Bảo thủ (Min Risk)']} cổ phiếu",
+                f"{df_weights['Bảo thủ (Min Risk)'].max():.2%}"
+            ],
+            'Cân bằng (Max Sharpe)': [
+                f"{stats_max_sharpe[0]:.2%}", 
+                f"{stats_max_sharpe[1]:.2%}", 
+                f"{stats_max_sharpe[2]:.2f}",
+                f"{st.session_state.num_stocks['Cân bằng (Max Sharpe)']} cổ phiếu",
+                f"{df_weights['Cân bằng (Max Sharpe)'].max():.2%}"
+            ],
+            'Mạo hiểm (Max Return)': [
+                f"{stats_max_ret[0]:.2%}", 
+                f"{stats_max_ret[1]:.2%}", 
+                f"{stats_max_ret[2]:.2f}",
+                f"{st.session_state.num_stocks['Mạo hiểm (Max Return)']} cổ phiếu",
+                f"{df_weights['Mạo hiểm (Max Return)'].max():.2%}"
+            ]
+        }, index=['Lợi nhuận Kỳ vọng', 'Rủi ro (Độ lệch chuẩn)', 'Chỉ số Sharpe', 'Số lượng CP', 'Tỷ trọng CP lớn nhất'])
+        st.dataframe(comparison_df, use_container_width=True)
 
-    with tab2:
-        st.header("2. Kết quả Backtest")
+    # Tab 3: Kết quả Backtest
+    with tab3:
+        st.header("📈 Kết quả Backtest & Hiệu suất")
         
         st.subheader("Bảng Tổng kết Chỉ số Hiệu suất")
         summary_table = st.session_state.summary_table
@@ -517,7 +1041,33 @@ if st.session_state.analysis_done:
         styler = summary_table.style
         styler.format('{:,.2%}', subset=(percent_rows, slice(None)))
         styler.format('{:,.2f}', subset=(number_row, slice(None)))
+        
+        # THÊM: Highlight giá trị tốt nhất
+        styler.highlight_max(axis=1, color='lightgreen', subset=pd.IndexSlice[['Tổng Lợi nhuận (Cumulative)', 'Lợi nhuận TB Năm (Annualized)', 'Chỉ số Sharpe (Historical)'], :])
+        styler.highlight_min(axis=1, color='lightgreen', subset=pd.IndexSlice[['Rủi ro Năm (Annualized)', 'Mức sụt giảm Tối đa (Max Drawdown)'], :])
+        
         st.dataframe(styler, use_container_width=True)
+        
+        st.divider()
+        
+        # THÊM: Các metrics nổi bật
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            best_return = summary_table.loc['Lợi nhuận TB Năm (Annualized)'].idxmax()
+            best_return_val = summary_table.loc['Lợi nhuận TB Năm (Annualized)', best_return]
+            st.metric("🏆 Danh mục có Return cao nhất", best_return, f"{best_return_val:.2%}")
+        
+        with col2:
+            best_sharpe = summary_table.loc['Chỉ số Sharpe (Historical)'].idxmax()
+            best_sharpe_val = summary_table.loc['Chỉ số Sharpe (Historical)', best_sharpe]
+            st.metric("⚖️ Danh mục có Sharpe tốt nhất", best_sharpe, f"{best_sharpe_val:.2f}")
+        
+        with col3:
+            lowest_risk = summary_table.loc['Rủi ro Năm (Annualized)'].idxmin()
+            lowest_risk_val = summary_table.loc['Rủi ro Năm (Annualized)', lowest_risk]
+            st.metric("🛡️ Danh mục có Risk thấp nhất", lowest_risk, f"{lowest_risk_val:.2%}")
+        
+        st.divider()
         
         st.subheader(f"So sánh Hiệu quả Tăng trưởng (Từ {st.session_state.start_time_str})")
         fig_backtest = px.line(
@@ -528,9 +1078,37 @@ if st.session_state.analysis_done:
             template='plotly_dark', 
             yaxis_title='Giá trị Danh mục (Bắt đầu từ 1.0)', 
             legend_title='Danh mục',
-            yaxis_tickformat='.2f'
+            yaxis_tickformat='.2f',
+            height=600,
+            hovermode='x unified'
         )
         st.plotly_chart(fig_backtest, use_container_width=True)
+        
+        # THÊM: Biểu đồ Drawdown
+        st.subheader("Phân tích Drawdown (Mức sụt giảm)")
+        drawdown_data = {}
+        for col in st.session_state.all_cumulative_df.columns:
+            cumulative = st.session_state.all_cumulative_df[col]
+            running_max = cumulative.cummax()
+            drawdown = (cumulative - running_max) / running_max
+            drawdown_data[col] = drawdown
+        
+        drawdown_df = pd.DataFrame(drawdown_data)
+        fig_drawdown = px.line(
+            drawdown_df,
+            title='Phân tích Drawdown theo thời gian'
+        )
+        fig_drawdown.update_layout(
+            template='plotly_dark',
+            yaxis_title='Drawdown',
+            yaxis_tickformat='.1%',
+            height=500,
+            hovermode='x unified'
+        )
+        fig_drawdown.add_hline(y=0, line_dash="dash", line_color="white", opacity=0.5)
+        st.plotly_chart(fig_drawdown, use_container_width=True)
+        
+        st.divider()
         
         st.subheader("Phân tích Chi tiết Hiệu suất Backtest")
         port_names = summary_table.columns
@@ -556,7 +1134,7 @@ if st.session_state.analysis_done:
         sharpe_metric = 'Chỉ số Sharpe (Historical)'
         fig_metrics.add_trace(go.Bar(
             x=port_names, y=summary_table.loc[sharpe_metric], text=summary_table.loc[sharpe_metric],
-            texttemplate='%{y:.2f}', name=sharpe_metric
+            texttemplate='%{y:.2f}', name=sharpe_metric, marker_color='cyan'
         ), row=3, col=1)
         
         fig_metrics.update_layout(height=1000, template='plotly_dark', barmode='group')
@@ -564,31 +1142,443 @@ if st.session_state.analysis_done:
         fig_metrics.update_yaxes(title_text='Rủi ro', tickformat='.0%', row=2, col=1)
         fig_metrics.update_yaxes(title_text='Tỷ lệ', tickformat='.2f', row=3, col=1)
         st.plotly_chart(fig_metrics, use_container_width=True)
+    
+    # Tab 4: Phân tích Rủi ro & Đa dạng
+    with tab4:
+        st.header("🛡️ Phân tích Rủi ro & Đa dạng hóa")
         
-    with tab3:
-        st.header("3. Dữ liệu Thô & Phân tích Tương quan")
+        st.info(f"""
+        **💡 Nguyên tắc "Không bỏ hết trứng vào 1 giỏ":**
+        - Tỷ trọng tối đa mỗi cổ phiếu: **{MAX_WEIGHT*100:.0f}%**
+        - Số cổ phiếu tối thiểu: **{min_stocks} cổ phiếu**
+        - Mục tiêu: Giảm rủi ro tập trung, tăng tính ổn định của danh mục
+        """)
         
-        st.subheader("Heatmap Ma trận Tương quan")
-        returns_df = st.session_state.returns_df
-        correlation_matrix = returns_df.corr()
-        labels = correlation_matrix.columns
-        fig_heatmap = go.Figure(data=go.Heatmap(
-            z=correlation_matrix.values, x=labels, y=labels,
-            colorscale='RdBu_r', zmin=-1, zmax=1,
-            hoverongaps=False
-        ))
-        fig_heatmap.update_layout(
-            title='Heatmap Ma trận Tương quan (VN30)', template='plotly_dark',
-            height=700, width=800,
-            yaxis_autorange='reversed'
+        st.divider()
+        
+        # THÊM: Herfindahl Index - Chỉ số tập trung
+        st.subheader("Chỉ số Tập trung (Herfindahl Index)")
+        st.markdown("""
+        **Herfindahl Index** đo lường mức độ tập trung của danh mục:
+        - Giá trị gần 1: Tập trung cao (rủi ro)
+        - Giá trị gần 0: Đa dạng hóa tốt (ít rủi ro)
+        """)
+        
+        herfindahl_data = {}
+        for col in st.session_state.optimal_weights_df.columns:
+            weights = st.session_state.optimal_weights_df[col]
+            herfindahl = (weights ** 2).sum()
+            herfindahl_data[col] = herfindahl
+        
+        herfindahl_df = pd.DataFrame({
+            'Danh mục': list(herfindahl_data.keys()),
+            'Herfindahl Index': list(herfindahl_data.values())
+        })
+        
+        fig_herfindahl = px.bar(
+            herfindahl_df, x='Danh mục', y='Herfindahl Index',
+            title='Chỉ số Herfindahl - Mức độ Tập trung Danh mục',
+            text='Herfindahl Index',
+            color='Herfindahl Index',
+            color_continuous_scale='RdYlGn_r'
         )
-        st.plotly_chart(fig_heatmap, use_container_width=True)
+        fig_herfindahl.update_traces(texttemplate='%{text:.3f}', textposition='outside')
+        fig_herfindahl.update_layout(template='plotly_dark', height=500, showlegend=False)
+        fig_herfindahl.add_hline(y=1/min_stocks, line_dash="dash", line_color="yellow",
+                                annotation_text=f"Phân bổ đều {min_stocks} CP")
+        st.plotly_chart(fig_herfindahl, use_container_width=True)
         
-        st.subheader("Dữ liệu Giá Đóng cửa (Pivot)")
-        st.dataframe(st.session_state.price_pivot.tail())
+        st.divider()
         
-        st.subheader("Dữ liệu Tỷ suất sinh lời (Hàng ngày)")
-        st.dataframe(st.session_state.returns_df.tail())
+        # THÊM: Contribution to Risk (VaR)
+        st.subheader("Đóng góp Rủi ro của từng Cổ phiếu")
+        selected_portfolio_risk = st.selectbox(
+            "Chọn danh mục để phân tích:",
+            options=st.session_state.optimal_weights_df.columns.tolist(),
+            key='risk_analysis'
+        )
         
-        st.subheader("Dữ liệu Thô (Tải về)")
-        st.dataframe(st.session_state.raw_data.tail())
+        weights = st.session_state.optimal_weights_df[selected_portfolio_risk].values
+        cov_matrix = st.session_state.cov_matrix
+        
+        # Tính Marginal Contribution to Risk
+        portfolio_variance = np.dot(weights.T, np.dot(cov_matrix, weights))
+        portfolio_std = np.sqrt(portfolio_variance)
+        
+        marginal_contrib = np.dot(cov_matrix, weights) / portfolio_std
+        contrib_to_risk = weights * marginal_contrib
+        contrib_to_risk_pct = contrib_to_risk / contrib_to_risk.sum()
+        
+        risk_contrib_df = pd.DataFrame({
+            'Cổ phiếu': st.session_state.optimal_weights_df.index,
+            'Tỷ trọng': weights,
+            'Đóng góp Rủi ro (%)': contrib_to_risk_pct
+        }).sort_values('Đóng góp Rủi ro (%)', ascending=False).head(15)
+        
+        fig_risk_contrib = go.Figure()
+        fig_risk_contrib.add_trace(go.Bar(
+            x=risk_contrib_df['Cổ phiếu'],
+            y=risk_contrib_df['Tỷ trọng'],
+            name='Tỷ trọng',
+            marker_color='lightblue',
+            yaxis='y',
+            offsetgroup=1
+        ))
+        fig_risk_contrib.add_trace(go.Bar(
+            x=risk_contrib_df['Cổ phiếu'],
+            y=risk_contrib_df['Đóng góp Rủi ro (%)'],
+            name='Đóng góp Rủi ro',
+            marker_color='salmon',
+            yaxis='y',
+            offsetgroup=2
+        ))
+        
+        fig_risk_contrib.update_layout(
+            title=f'So sánh Tỷ trọng vs Đóng góp Rủi ro - {selected_portfolio_risk}',
+            xaxis_title='Cổ phiếu',
+            yaxis_title='Giá trị (%)',
+            template='plotly_dark',
+            height=600,
+            barmode='group',
+            yaxis_tickformat='.1%'
+        )
+        st.plotly_chart(fig_risk_contrib, use_container_width=True)
+        
+        st.markdown("""
+        **Giải thích:**
+        - **Tỷ trọng**: Tỷ lệ % vốn đầu tư vào mỗi cổ phiếu
+        - **Đóng góp Rủi ro**: % rủi ro mà mỗi cổ phiếu đóng góp vào tổng rủi ro danh mục
+        - Nếu Đóng góp Rủi ro >> Tỷ trọng → Cổ phiếu này có tương quan cao với các cổ phiếu khác
+        """)
+        
+        st.divider()
+        
+        # THÊM: Effective Number of Assets
+        st.subheader("Số lượng Cổ phiếu Hiệu quả (ENB)")
+        st.markdown("""
+        **ENB (Effective Number of Bets)** = 1 / Herfindahl Index  
+        Đo lường số lượng cổ phiếu "thực sự độc lập" trong danh mục.
+        """)
+        
+        enb_data = {}
+        for col in st.session_state.optimal_weights_df.columns:
+            weights = st.session_state.optimal_weights_df[col]
+            herfindahl = (weights ** 2).sum()
+            enb = 1 / herfindahl if herfindahl > 0 else 0
+            enb_data[col] = {
+                'ENB': enb,
+                'Số CP thực tế': st.session_state.num_stocks[col],
+                'Hiệu quả Đa dạng': enb / st.session_state.num_stocks[col] if st.session_state.num_stocks[col] > 0 else 0
+            }
+        
+        enb_df = pd.DataFrame(enb_data).T
+        enb_df_styled = enb_df.style.format({
+            'ENB': '{:.2f}',
+            'Số CP thực tế': '{:.0f}',
+            'Hiệu quả Đa dạng': '{:.1%}'
+        }).background_gradient(cmap='RdYlGn', subset=['Hiệu quả Đa dạng'])
+        
+        st.dataframe(enb_df_styled, use_container_width=True)
+        
+        st.markdown("""
+        **Giải thích:**
+        - **ENB**: Số cổ phiếu có trọng số bằng nhau tương đương với danh mục hiện tại
+        - **Hiệu quả Đa dạng**: Tỷ lệ ENB / Số CP thực tế (càng cao càng tốt, tối đa 100%)
+        - Hiệu quả 100% = Phân bổ hoàn toàn đều, < 50% = Tập trung cao
+        """)
+        
+        st.divider()
+        
+        # THÊM: Risk-Return Scatter của từng cổ phiếu
+        st.subheader("Ma trận Rủi ro - Lợi nhuận từng Cổ phiếu")
+        
+        individual_stats = pd.DataFrame({
+            'Return': st.session_state.expected_returns,
+            'Risk': np.sqrt(np.diag(st.session_state.cov_matrix))
+        })
+        individual_stats['Sharpe'] = (individual_stats['Return'] - RISK_FREE_RATE) / individual_stats['Risk']
+        
+        fig_scatter = px.scatter(
+            individual_stats, 
+            x='Risk', 
+            y='Return',
+            text=individual_stats.index,
+            color='Sharpe',
+            color_continuous_scale='RdYlGn',
+            title='Ma trận Rủi ro - Lợi nhuận của từng Cổ phiếu trong VN30',
+            size=abs(individual_stats['Sharpe']),
+            size_max=15
+        )
+        fig_scatter.update_traces(textposition='top center', textfont_size=8)
+        fig_scatter.update_layout(
+            template='plotly_dark',
+            height=700,
+            xaxis_tickformat='.1%',
+            yaxis_tickformat='.1%',
+            xaxis_title='Rủi ro (Độ lệch chuẩn)',
+            yaxis_title='Lợi nhuận Kỳ vọng'
+        )
+        st.plotly_chart(fig_scatter, use_container_width=True)
+    
+    # Tab 5: Sector Analysis & ML
+    with tab5:
+        st.header("🏢 Phân tích Phân bổ theo Ngành & Machine Learning")
+        
+        # === PHẦN 1: SECTOR ANALYSIS ===
+        st.subheader("Phân tích Phân bổ theo Ngành")
+        
+        sector_allocation = get_sector_allocation(st.session_state.optimal_weights_df)
+        
+        # Hiển thị bảng
+        st.dataframe(
+            sector_allocation.style.format("{:.2%}").background_gradient(cmap='Blues'),
+            use_container_width=True
+        )
+        
+        # Biểu đồ cột so sánh
+        sector_long = sector_allocation.reset_index().melt(
+            id_vars='index',
+            var_name='Danh mục',
+            value_name='Tỷ trọng'
+        )
+        sector_long.rename(columns={'index': 'Ngành'}, inplace=True)
+        
+        fig_sector = px.bar(
+            sector_long,
+            x='Danh mục',
+            y='Tỷ trọng',
+            color='Ngành',
+            title='Phân bổ theo Ngành - So sánh 3 Danh mục',
+            text_auto='.1%'
+        )
+        fig_sector.update_layout(template='plotly_dark', yaxis_tickformat='.0%', height=500)
+        st.plotly_chart(fig_sector, use_container_width=True)
+        
+        # Biểu đồ tròn cho từng danh mục
+        col1, col2, col3 = st.columns(3)
+        
+        for idx, (col, portfolio) in enumerate(zip([col1, col2, col3], sector_allocation.columns)):
+            with col:
+                sector_data = sector_allocation[portfolio]
+                sector_data = sector_data[sector_data > 0.001]
+                
+                fig_sector_pie = go.Figure(data=[go.Pie(
+                    labels=sector_data.index,
+                    values=sector_data.values,
+                    hole=0.3
+                )])
+                fig_sector_pie.update_layout(
+                    title=portfolio,
+                    template='plotly_dark',
+                    height=400,
+                    showlegend=True
+                )
+                st.plotly_chart(fig_sector_pie, use_container_width=True)
+        
+        # Phân tích đa dạng hóa ngành
+        st.subheader("Chỉ số Đa dạng hóa theo Ngành")
+        
+        sector_diversity = {}
+        for portfolio in sector_allocation.columns:
+            sectors = sector_allocation[portfolio]
+            sectors = sectors[sectors > 0.001]
+            hhi = (sectors ** 2).sum()
+            enb = 1 / hhi if hhi > 0 else 0
+            sector_diversity[portfolio] = {
+                'Số ngành': len(sectors),
+                'HHI (Ngành)': hhi,
+                'ENB (Ngành)': enb,
+                'Ngành lớn nhất': sectors.idxmax(),
+                'Tỷ trọng lớn nhất': sectors.max()
+            }
+        
+        sector_div_df = pd.DataFrame(sector_diversity).T
+        st.dataframe(
+            sector_div_df.style.format({
+                'Số ngành': '{:.0f}',
+                'HHI (Ngành)': '{:.3f}',
+                'ENB (Ngành)': '{:.2f}',
+                'Tỷ trọng lớn nhất': '{:.2%}'
+            }),
+            use_container_width=True
+        )
+        
+        st.divider()
+        
+        # === PHẦN 2: MACHINE LEARNING ===
+        st.header("🤖 Machine Learning - Phân tích Nâng cao")
+        
+        # === PHẦN 1: DỰ ĐOÁN RETURNS ===
+        st.subheader("Dự đoán Lợi nhuận bằng Random Forest")
+        
+        with st.spinner("⏳ Đang huấn luyện mô hình Machine Learning..."):
+            predictions, feature_importance = ml_predict_returns(
+                st.session_state.returns_df,
+                st.session_state.price_pivot
+            )
+        
+        if predictions:
+            # Chọn cổ phiếu để xem
+            selected_ticker_ml = st.selectbox(
+                "Chọn cổ phiếu để xem dự đoán:",
+                options=list(predictions.keys())
+            )
+            
+            pred_data = predictions[selected_ticker_ml]
+            
+            # Metrics
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.metric("🎯 Độ chính xác (R² Score)", f"{pred_data['score']:.3f}")
+            with col2:
+                mae = np.mean(np.abs(pred_data['actual'] - pred_data['predicted']))
+                st.metric("📊 MAE", f"{mae:.4f}")
+            with col3:
+                rmse = np.sqrt(np.mean((pred_data['actual'] - pred_data['predicted'])**2))
+                st.metric("📉 RMSE", f"{rmse:.4f}")
+            
+            # Biểu đồ so sánh Actual vs Predicted
+            comparison_ml = pd.DataFrame({
+                'Thực tế': pred_data['actual'],
+                'Dự đoán': pred_data['predicted']
+            })
+            
+            fig_ml = go.Figure()
+            fig_ml.add_trace(go.Scatter(
+                y=comparison_ml['Thực tế'],
+                mode='lines',
+                name='Thực tế',
+                line=dict(color='cyan')
+            ))
+            fig_ml.add_trace(go.Scatter(
+                y=comparison_ml['Dự đoán'],
+                mode='lines',
+                name='Dự đoán',
+                line=dict(color='orange', dash='dash')
+            ))
+            fig_ml.update_layout(
+                title=f'So sánh Returns Thực tế vs Dự đoán - {selected_ticker_ml}',
+                template='plotly_dark',
+                yaxis_title='Returns',
+                xaxis_title='Thời gian (Test Set)',
+                height=500
+            )
+            st.plotly_chart(fig_ml, use_container_width=True)
+            
+            # Feature Importance
+            st.subheader("Độ quan trọng của Features")
+            fi_df = feature_importance[selected_ticker_ml].sort_values(ascending=False)
+            
+            fig_fi = px.bar(
+                x=fi_df.values,
+                y=fi_df.index,
+                orientation='h',
+                title=f'Feature Importance - {selected_ticker_ml}',
+                labels={'x': 'Importance', 'y': 'Feature'}
+            )
+            fig_fi.update_layout(template='plotly_dark', height=400)
+            st.plotly_chart(fig_fi, use_container_width=True)
+            
+            st.info("""
+            **Giải thích Features:**
+            - **return_lag1/2/3**: Lợi nhuận 1, 2, 3 ngày trước
+            - **return_ma5/20**: Moving average 5, 20 ngày
+            - **volatility_20**: Độ biến động 20 ngày
+            """)
+        else:
+            st.warning("Không đủ dữ liệu để huấn luyện mô hình ML")
+        
+        st.divider()
+        
+        # === PHẦN 2: CLUSTERING ===
+        st.subheader("Phân nhóm Cổ phiếu (K-Means Clustering)")
+        
+        n_clusters = st.slider(
+            "Số nhóm (clusters):",
+            min_value=2, max_value=5, value=3, step=1
+        )
+        
+        with st.spinner("⏳ Đang phân nhóm cổ phiếu..."):
+            cluster_result = cluster_stocks(st.session_state.returns_df, n_clusters)
+        
+        # Hiển thị bảng
+        st.dataframe(
+            cluster_result.style.format({
+                'mean_return': '{:.4f}',
+                'volatility': '{:.4f}',
+                'sharpe': '{:.2f}',
+                'skewness': '{:.2f}',
+                'kurtosis': '{:.2f}'
+            }).background_gradient(cmap='viridis', subset=['Cluster']),
+            use_container_width=True
+        )
+        
+        # Biểu đồ scatter 3D
+        fig_cluster = px.scatter_3d(
+            cluster_result,
+            x='mean_return',
+            y='volatility',
+            z='sharpe',
+            color='Cluster',
+            text='Ticker',
+            title='Phân nhóm Cổ phiếu theo Risk-Return Profile',
+            labels={
+                'mean_return': 'Return TB',
+                'volatility': 'Volatility',
+                'sharpe': 'Sharpe Ratio'
+            },
+            color_continuous_scale='viridis'
+        )
+        fig_cluster.update_traces(textposition='top center', textfont_size=8)
+        fig_cluster.update_layout(template='plotly_dark', height=700)
+        st.plotly_chart(fig_cluster, use_container_width=True)
+        
+        # Phân tích từng cluster
+        st.subheader("Đặc điểm từng Nhóm")
+        
+        for cluster_id in range(n_clusters):
+            cluster_data = cluster_result[cluster_result['Cluster'] == cluster_id]
+            
+            with st.expander(f"🔹 Nhóm {cluster_id} ({len(cluster_data)} cổ phiếu)"):
+                col1, col2, col3, col4 = st.columns(4)
+                with col1:
+                    st.metric("Return TB", f"{cluster_data['mean_return'].mean():.4f}")
+                with col2:
+                    st.metric("Volatility TB", f"{cluster_data['volatility'].mean():.4f}")
+                with col3:
+                    st.metric("Sharpe TB", f"{cluster_data['sharpe'].mean():.2f}")
+                with col4:
+                    st.metric("Số cổ phiếu", len(cluster_data))
+                
+                st.write("**Danh sách cổ phiếu:**", ", ".join(cluster_data['Ticker'].tolist()))
+        
+        st.info("""
+        **Ứng dụng Clustering:**
+        - Xác định các cổ phiếu có đặc tính tương tự
+        - Đa dạng hóa bằng cách chọn cổ phiếu từ các nhóm khác nhau
+        - Hiểu rõ hơn về cấu trúc thị trường VN30
+        """)
+        
+        st.divider()
+        
+        # === PHẦN 3: KHUYẾN NGHỊ ===
+        st.subheader("Khuyến nghị Dựa trên Machine Learning")
+        
+        # Top cổ phiếu theo ML score
+        if predictions:
+            ml_scores = {ticker: data['score'] for ticker, data in predictions.items()}
+            top_ml = sorted(ml_scores.items(), key=lambda x: x[1], reverse=True)[:5]
+            
+            st.success("**Top 5 cổ phiếu dự đoán tốt nhất (ML Score cao):**")
+            for i, (ticker, score) in enumerate(top_ml, 1):
+                st.write(f"{i}. **{ticker}**: R² Score = {score:.3f}")
+        
+        # Top cổ phiếu theo Sharpe trong mỗi cluster
+        st.warning("**⚖️ Khuyến nghị Đa dạng hóa theo Cluster:**")
+        for cluster_id in range(n_clusters):
+            cluster_data = cluster_result[cluster_result['Cluster'] == cluster_id]
+            best_in_cluster = cluster_data.nlargest(1, 'sharpe')
+            if not best_in_cluster.empty:
+                ticker = best_in_cluster.iloc[0]['Ticker']
+                sharpe = best_in_cluster.iloc[0]['sharpe']
+                st.write(f"- **Nhóm {cluster_id}**: Chọn **{ticker}** (Sharpe = {sharpe:.2f})")
