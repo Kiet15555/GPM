@@ -1574,7 +1574,7 @@ if st.session_state.analysis_done:
                 st.write(f"{i}. **{ticker}**: R² Score = {score:.3f}")
         
         # Top cổ phiếu theo Sharpe trong mỗi cluster
-        st.warning("**⚖️ Khuyến nghị Đa dạng hóa theo Cluster:**")
+        st.warning("**Khuyến nghị Đa dạng hóa theo Cluster:**")
         for cluster_id in range(n_clusters):
             cluster_data = cluster_result[cluster_result['Cluster'] == cluster_id]
             best_in_cluster = cluster_data.nlargest(1, 'sharpe')
