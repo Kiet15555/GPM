@@ -8,3 +8,4 @@ quantstats
 pyarrow
 scikit-learn
 xlsxwriter
+ipython
